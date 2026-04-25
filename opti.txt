@@ -1,0 +1,1111 @@
+Skip to main content
+Boundary Conditions and Moment Computation
+33,490 tokens
+
+```collide_and_stream.comp
+#version 450
+#extension GL_EXT_scalar_block_layout : require
+#extension GL_GOOGLE_include_directive : require
+
+#include "simulate_header.glsl"
+
+layout (local_size_x = 4, local_size_y = 4, local_size_z = 4) in;
+
+// 共享内存：存储本 block 及一层 halo 的全部矩数据
+// 布局为 [10 * (BLOCK_X+2) * (BLOCK_Y+2) * (BLOCK_Z+2)]
+// 为方便索引，定义宏来访问对应分量
+#define SHARED_SIZE_X 6   // 4 + 2
+#define SHARED_SIZE_Y 6   // 4 + 2
+#define SHARED_SIZE_Z 6   // 4 + 2
+#define SHARED_STRIDE_Y (SHARED_SIZE_X)
+#define SHARED_STRIDE_Z (SHARED_SIZE_X * SHARED_SIZE_Y)
+#define SHARED_TOTAL_CELLS (SHARED_SIZE_X * SHARED_SIZE_Y * SHARED_SIZE_Z)
+
+shared float shRho  [SHARED_TOTAL_CELLS];
+shared float shUx   [SHARED_TOTAL_CELLS];
+shared float shUy   [SHARED_TOTAL_CELLS];
+shared float shUz   [SHARED_TOTAL_CELLS];
+shared float shSxx  [SHARED_TOTAL_CELLS];
+shared float shSyy  [SHARED_TOTAL_CELLS];
+shared float shSzz  [SHARED_TOTAL_CELLS];
+shared float shSxy  [SHARED_TOTAL_CELLS];
+shared float shSxz  [SHARED_TOTAL_CELLS];
+shared float shSyz  [SHARED_TOTAL_CELLS];
+
+// 根据壁面类型和参考流体节点矩，计算 ghost 节点应存储的修正矩
+void compute_ghost_moments_for_wall(
+    ivec3 ghost_coord, ivec3 ref_coord, int wall_type, vec3 wall_normal,
+    out float mRho, out vec3 mU, out float mS[6]
+) {
+    // 读取参考流体节点矩
+    uint ref_idx = (ref_coord.z * ubo.gridSize.y + ref_coord.y) * ubo.gridSize.x + ref_coord.x;
+    float rho_ref;
+    vec3 u_ref;
+    float S_ref[6];
+    load_moments(ref_idx, rho_ref, u_ref, S_ref);
+
+    mRho = rho_ref;  // 密度近似不变
+
+    vec3 u_wall = vec3(0.0);  // 静止壁面
+    if (wall_type == BC_SOLID_NO_SLIP) {
+        mU = u_wall;
+    } else {  // BC_SOLID_FREE_SLIP
+        mU = u_ref - dot(u_ref, wall_normal) * wall_normal;
+    }
+
+    // 应力张量：S_ghost = S_ref - u_ref⊗u_ref + u_ghost⊗u_ghost
+    float ux = u_ref.x, uy = u_ref.y, uz = u_ref.z;
+    float ugx = mU.x, ugy = mU.y, ugz = mU.z;
+    mS[0] = S_ref[0] - ux*ux + ugx*ugx;
+    mS[1] = S_ref[1] - uy*uy + ugy*ugy;
+    mS[2] = S_ref[2] - uz*uz + ugz*ugz;
+    mS[3] = S_ref[3] - ux*uy + ugx*ugy;
+    mS[4] = S_ref[4] - ux*uz + ugx*ugz;
+    mS[5] = S_ref[5] - uy*uz + ugy*ugz;
+}
+
+// 处理单个节点的边界矩逻辑：流入、流出、周期
+void get_moments_for_ghost(const ivec3 coord, out float mRho, out vec3 mU, out float mS[6]) {
+    ivec3 size = ubo.gridSize.xyz;
+    ivec3 clamped = clamp(coord, ivec3(0), size - 1);
+    bool is_custom_bc = false;
+
+    // --- 1. X 方向边界检查 ---
+    if (coord.x < 0 && BC_X0 != BC_PERIODIC) {
+        if (BC_X0 == BC_INFLOW) {
+            mRho = INFLOW_RHO; mU = INFLOW_VEL;
+            mS[0]=mRho*mU.x*mU.x; mS[1]=mRho*mU.y*mU.y; mS[2]=mRho*mU.z*mU.z;
+            mS[3]=mRho*mU.x*mU.y; mS[4]=mRho*mU.x*mU.z; mS[5]=mRho*mU.y*mU.z;
+        } else if (BC_X0 == BC_OUTFLOW) { // BC_OUTFLOW: Neumann + Backflow Prevention
+            uint b_idx = (clamped.z * size.y + clamped.y) * size.x + clamped.x;
+            load_moments(b_idx, mRho, mU, mS);
+            mRho = OUTFLOW_RHO;
+            if (mU.x > 0.0) { mU = vec3(0); for(int j=0; j<6; j++) mS[j]=0; } // X0面外法向是-x，ux>0即回流
+        } else {
+            ivec3 ref = ivec3(0, clamp(coord.y, 0, size.y-1), clamp(coord.z, 0, size.z-1));
+            compute_ghost_moments_for_wall(coord, ref, int(BC_X0), vec3(-1,0,0), mRho, mU, mS);
+        }
+        is_custom_bc = true;
+    } else if (coord.x >= size.x && BC_XN != BC_PERIODIC) {
+        if (BC_XN == BC_INFLOW) {
+            mRho = INFLOW_RHO; mU = INFLOW_VEL;
+            mS[0]=mRho*mU.x*mU.x; mS[1]=mRho*mU.y*mU.y; mS[2]=mRho*mU.z*mU.z;
+            mS[3]=mRho*mU.x*mU.y; mS[4]=mRho*mU.x*mU.z; mS[5]=mRho*mU.y*mU.z;
+        } else if (BC_XN == BC_OUTFLOW) { // BC_OUTFLOW
+            uint b_idx = (clamped.z * size.y + clamped.y) * size.x + clamped.x;
+            load_moments(b_idx, mRho, mU, mS);
+            mRho = OUTFLOW_RHO;
+            if (mU.x < 0.0) { mU = vec3(0); for(int j=0; j<6; j++) mS[j]=0; } // XN面外法向是+x，ux<0即回流
+        } else {
+            ivec3 ref = ivec3(size.x-1, clamp(coord.y, 0, size.y-1), clamp(coord.z, 0, size.z-1));
+            compute_ghost_moments_for_wall(coord, ref, int(BC_XN), vec3(1,0,0), mRho, mU, mS);
+        }
+        is_custom_bc = true;
+    }
+
+    // --- 2. Y 方向边界检查 (若X未触发) ---
+    if (!is_custom_bc) {
+        if (coord.y < 0 && BC_Y0 != BC_PERIODIC) {
+            if (BC_Y0 == BC_INFLOW) {
+                mRho = INFLOW_RHO; mU = INFLOW_VEL;
+                mS[0]=mRho*mU.x*mU.x; mS[1]=mRho*mU.y*mU.y; mS[2]=mRho*mU.z*mU.z;
+                mS[3]=mRho*mU.x*mU.y; mS[4]=mRho*mU.x*mU.z; mS[5]=mRho*mU.y*mU.z;
+            } else if (BC_Y0 == BC_OUTFLOW) { // OUTFLOW
+                uint b_idx = (clamped.z * size.y + clamped.y) * size.x + clamped.x;
+                load_moments(b_idx, mRho, mU, mS);
+                mRho = OUTFLOW_RHO;
+                if (mU.y > 0.0) { mU = vec3(0); for(int j=0; j<6; j++) mS[j]=0; }
+            } else {
+                ivec3 ref = ivec3(clamp(coord.x, 0, size.x-1), 0, clamp(coord.z, 0, size.z-1));
+                compute_ghost_moments_for_wall(coord, ref, int(BC_Y0), vec3(0,-1,0), mRho, mU, mS);
+            }
+            is_custom_bc = true;
+        } else if (coord.y >= size.y && BC_YN != BC_PERIODIC) {
+            if (BC_YN == BC_INFLOW) {
+                mRho = INFLOW_RHO; mU = INFLOW_VEL;
+                mS[0]=mRho*mU.x*mU.x; mS[1]=mRho*mU.y*mU.y; mS[2]=mRho*mU.z*mU.z;
+                mS[3]=mRho*mU.x*mU.y; mS[4]=mRho*mU.x*mU.z; mS[5]=mRho*mU.y*mU.z;
+            } else if (BC_YN == BC_OUTFLOW) { // OUTFLOW
+                uint b_idx = (clamped.z * size.y + clamped.y) * size.x + clamped.x;
+                load_moments(b_idx, mRho, mU, mS);
+                mRho = OUTFLOW_RHO;
+                if (mU.y < 0.0) { mU = vec3(0); for(int j=0; j<6; j++) mS[j]=0; }
+            } else {
+                ivec3 ref = ivec3(clamp(coord.x, 0, size.x-1), size.y-1, clamp(coord.z, 0, size.z-1));
+                compute_ghost_moments_for_wall(coord, ref, int(BC_YN), vec3(0,1,0), mRho, mU, mS);
+            }
+            is_custom_bc = true;
+        }
+    }
+
+    // --- 3. Z 方向边界检查 (若XY未触发) ---
+    if (!is_custom_bc) {
+        if (coord.z < 0 && BC_Z0 != BC_PERIODIC) {
+            if (BC_Z0 == BC_INFLOW) {
+                mRho = INFLOW_RHO; mU = INFLOW_VEL;
+                mS[0]=mRho*mU.x*mU.x; mS[1]=mRho*mU.y*mU.y; mS[2]=mRho*mU.z*mU.z;
+                mS[3]=mRho*mU.x*mU.y; mS[4]=mRho*mU.x*mU.z; mS[5]=mRho*mU.y*mU.z;
+            } else if (BC_Z0 == BC_OUTFLOW) { // OUTFLOW
+                uint b_idx = (clamped.z * size.y + clamped.y) * size.x + clamped.x;
+                load_moments(b_idx, mRho, mU, mS);
+                mRho = OUTFLOW_RHO;
+                if (mU.z > 0.0) { mU = vec3(0); for(int j=0; j<6; j++) mS[j]=0; }
+            } else {
+                ivec3 ref = ivec3(clamp(coord.x, 0, size.x-1), clamp(coord.y, 0, size.y-1), 0);
+                compute_ghost_moments_for_wall(coord, ref, int(BC_Z0), vec3(0,0,-1), mRho, mU, mS);
+            }
+            is_custom_bc = true;
+        } else if (coord.z >= size.z && BC_ZN != BC_PERIODIC) {
+            if (BC_ZN == BC_INFLOW) {
+                mRho = INFLOW_RHO; mU = INFLOW_VEL;
+                mS[0]=mRho*mU.x*mU.x; mS[1]=mRho*mU.y*mU.y; mS[2]=mRho*mU.z*mU.z;
+                mS[3]=mRho*mU.x*mU.y; mS[4]=mRho*mU.x*mU.z; mS[5]=mRho*mU.y*mU.z;
+            } else if (BC_ZN == BC_OUTFLOW) { // OUTFLOW
+                uint b_idx = (clamped.z * size.y + clamped.y) * size.x + clamped.x;
+                load_moments(b_idx, mRho, mU, mS);
+                mRho = OUTFLOW_RHO;
+                if (mU.z < 0.0) { mU = vec3(0); for(int j=0; j<6; j++) mS[j]=0; }
+            } else {
+                ivec3 ref = ivec3(clamp(coord.x, 0, size.x-1), clamp(coord.y, 0, size.y-1), size.z-1);
+                compute_ghost_moments_for_wall(coord, ref, int(BC_ZN), vec3(0,0,1), mRho, mU, mS);
+            }
+            is_custom_bc = true;
+        }
+    }
+
+    // --- 4. 周期性处理 (所有自定义BC均未触发或处于内部) ---
+    if (!is_custom_bc) {
+        ivec3 wrap_coord = (coord % size + size) % size;
+        uint global_idx = (wrap_coord.z * size.y + wrap_coord.y) * size.x + wrap_coord.x;
+        load_moments(global_idx, mRho, mU, mS);
+    }
+}
+
+void main() {
+    ivec3 pos = ivec3(gl_GlobalInvocationID);
+
+    // ------------------------------------------------------------
+    // Step (a): load moment and reconstruct distribute function f_i (HOME-LBM Eq. 17)
+    // ------------------------------------------------------------
+    // -----------------------------------------------------------------
+    // 1. 协作加载矩数据到共享内存 (包含边界处理)
+    // -----------------------------------------------------------------
+    ivec3 group_start = ivec3(gl_WorkGroupID) * ivec3(gl_WorkGroupSize);
+    ivec3 local_id    = ivec3(gl_LocalInvocationID);
+
+    // 带 halo 的区域起始（全局坐标，可能为负，后面周期性处理）
+    ivec3 halo_start = group_start - ivec3(1);
+
+    // -----------------------------------------------------------------
+    // 2. 所有线程协作，将矩数据从全局内存加载到共享内存
+    //    采用循环分摊，每个线程负责加载若干个网格点
+    // -----------------------------------------------------------------
+    uint total_cells = SHARED_TOTAL_CELLS;
+    uint num_threads = gl_WorkGroupSize.x * gl_WorkGroupSize.y * gl_WorkGroupSize.z;
+
+    for (uint linear_idx = gl_LocalInvocationIndex; linear_idx < total_cells; linear_idx += num_threads) {
+        // 将线性索引转换为带 halo 区域内的局部坐标 (lx, ly, lz)
+        uint tmp = linear_idx;
+        uint lz = tmp / SHARED_STRIDE_Z;
+        tmp -= lz * SHARED_STRIDE_Z;
+        uint ly = tmp / SHARED_STRIDE_Y;
+        uint lx = tmp - ly * SHARED_STRIDE_Y;
+
+        // 对应的全局坐标
+        ivec3 global_coord = halo_start + ivec3(lx, ly, lz);
+        
+        // 加载矩数据
+        float rho;
+        vec3 u;
+        float S[6];
+        get_moments_for_ghost(global_coord, rho, u, S);
+
+        // 写入共享内存
+        shRho[linear_idx] = rho;
+        shUx [linear_idx] = u.x;
+        shUy [linear_idx] = u.y;
+        shUz [linear_idx] = u.z;
+        shSxx[linear_idx] = S[0];
+        shSyy[linear_idx] = S[1];
+        shSzz[linear_idx] = S[2];
+        shSxy[linear_idx] = S[3];
+        shSxz[linear_idx] = S[4];
+        shSyz[linear_idx] = S[5];
+    }
+
+    // 确保所有共享内存加载完成
+    barrier();
+    memoryBarrierShared();
+
+    // 边界检查：超出网格的线程跳过计算（但必须参与共享内存加载和barrier）
+    if (any(greaterThanEqual(pos, ubo.gridSize.xyz))) return;
+
+    // -----------------------------------------------------------------
+    // 3. 当前线程对应的全局索引与局部坐标（halo 区域内的坐标）
+    // -----------------------------------------------------------------
+    // 当前点在共享内存中的局部坐标（注意：halo 起始偏移 +1）
+    ivec3 local_pos = local_id + ivec3(1);
+    
+    // -----------------------------------------------------------------
+    // Step (b): Regular Streaming（从共享内存读取邻居矩）
+    // -----------------------------------------------------------------
+    float f_streamed[Q];
+    for (int i = 0; i < Q; i++) {
+        ivec3 src_local = local_pos - ivec3(c[i]);
+
+        // 边界处理：由于共享内存中已经包含了一层 halo，且 halo 数据已经过周期性处理，
+        // 因此 src_local 的合法范围是 [0, SHARED_SIZE-1]，不会越界。
+        // 但需要注意：如果网格尺寸很小（小于 block 尺寸），halo 可能会超出全局范围，
+        // 但周期性加载已经保证了数据有效，因此这里直接使用即可。
+        uint src_linear = src_local.z * SHARED_STRIDE_Z + src_local.y * SHARED_STRIDE_Y + src_local.x;
+
+        // 从共享内存读取邻居矩
+        float rho_src = shRho[src_linear];
+        vec3  u_src   = vec3(shUx[src_linear], shUy[src_linear], shUz[src_linear]);
+        float S_src[6] = {
+            shSxx[src_linear], shSyy[src_linear], shSzz[src_linear],
+            shSxy[src_linear], shSxz[src_linear], shSyz[src_linear]
+        };
+
+        // 重构单个方向的分布函数（使用已实现的单方向重构函数）
+        f_streamed[i] = reconstruct_single_ddf(i, rho_src, u_src, S_src);
+    }
+
+    // -----------------------------------------------------------------
+    // Step (c): 临时矩计算与碰撞（保持不变，仅将 load_moments 替换为读取自身矩？）
+    //           注意：这里的临时矩计算需要用到 f_streamed，已包含邻居流来的值。
+    //           自身分布函数重构不再需要（因为流后分布已由 f_streamed 给出）。
+    //           因此，原来 Step (a) 中 load_moments 和 reconstruct_ddfs 可以删除！
+    // -----------------------------------------------------------------
+    uint idx = (pos.z * ubo.gridSize.y + pos.y) * ubo.gridSize.x + pos.x;
+    
+    float rho_star = 0.0f;
+    vec3 rhou_star = vec3(0.0f);
+    float S_star[6] = float[6](0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f);
+
+    for (int i = 0; i < Q; i++) {
+        float fi = f_streamed[i];
+        rho_star += fi;
+        rhou_star += c[i] * fi;
+        // second-order moment
+        S_star[0] += (c[i].x*c[i].x - cs2) * fi;
+        S_star[1] += (c[i].y*c[i].y - cs2) * fi;
+        S_star[2] += (c[i].z*c[i].z - cs2) * fi;
+        S_star[3] += c[i].x*c[i].y * fi;
+        S_star[4] += c[i].x*c[i].z * fi;
+        S_star[5] += c[i].y*c[i].z * fi;
+    }
+    vec3 u_star = rhou_star / rho_star;
+
+    // 输入:
+    //   rho_star, u_star, S_star[6] : 从 f_streamed 经公式 (7) 计算出的临时矩（碰撞前）
+    //   F : 外力向量 (vec3)，如果无外力则传 vec3(0.0)
+    //   tau : 松弛时间（与粘度相关，ν = (τ - 0.5) * cs2）
+    // 输出:
+    //   rho_new, u_new, S_new[6] : 碰撞后的矩
+    vec3 F = vec3(cfs[idx], cfs[idx+ubo.gridSize.w], cfs[idx+2*ubo.gridSize.w]);
+
+    // ------------------------------------------------------------
+    // 1. 密度不变（质量守恒）
+    // ------------------------------------------------------------
+    float rho_new = rho_star;
+
+    // ------------------------------------------------------------
+    // 2. 速度更新（含半时步外力修正）
+    // ------------------------------------------------------------
+    vec3 u_new = u_star;
+    if (length(F) > 0.0) {
+        u_new += (0.5 / rho_star) * F;
+    }
+
+    // ------------------------------------------------------------
+    // 3. 应力张量更新 (中心矩碰撞模型)
+    // ------------------------------------------------------------
+    float omega = 1.0 / ubo.tau;          // 松弛频率
+    float inv_rho = 1.0 / rho_star;
+
+    // 为方便书写，将 u_star 分量展开
+    float ux = u_star.x, uy = u_star.y, uz = u_star.z;
+
+    // 外力分量
+    float Fx = F.x, Fy = F.y, Fz = F.z;
+
+    // 提取 S_star 各分量
+    float Sxx_s = S_star[0];
+    float Syy_s = S_star[1];
+    float Szz_s = S_star[2];
+    float Sxy_s = S_star[3];
+    float Sxz_s = S_star[4];
+    float Syz_s = S_star[5];
+
+    // ---------- 非对角元 (公式 23) ----------
+    // 注意：公式 (23) 在论文正文中为 Sxy，对应所有非对角元形式一致
+    float Sxy_new = (1.0 - omega) * Sxy_s + omega * (ux * uy);
+    float Sxz_new = (1.0 - omega) * Sxz_s + omega * (ux * uz);
+    float Syz_new = (1.0 - omega) * Syz_s + omega * (uy * uz);
+
+    // 如果有外力，需加上外力修正项（公式 (23) 中包含 F 的项）
+    if (length(F) > 0.0) {
+        float coeff = (1.0 - 0.5 * omega) * inv_rho;  // (1 - 1/(2τ)) / ρ*
+        Sxy_new += coeff * (Fx * uy + Fy * ux);
+        Sxz_new += coeff * (Fx * uz + Fz * ux);
+        Syz_new += coeff * (Fy * uz + Fz * uy);
+    }
+
+    // ---------- 对角元 (公式 23 下方三个公式) ----------
+    // 先计算公共部分
+    float trace_u2 = ux*ux + uy*uy + uz*uz;
+
+    // 计算各向异性松弛的系数（中心矩特有）
+    // 公式形式：S_αα_new = (1-ω)/3 * (2S*_αα - S*_ββ - S*_γγ) + 1/3 * (u*²_x+u*²_y+u*²_z)
+    //                    + ω/3 * (2u*²_α - u*²_β - u*²_γ) + (外力修正项)
+
+    // 无外力部分
+    float Sxx_base = (1.0 - omega) * (2.0 * Sxx_s - Syy_s - Szz_s) / 3.0
+                   + trace_u2 / 3.0
+                   + omega * (2.0 * ux*ux - uy*uy - uz*uz) / 3.0;
+    float Syy_base = (1.0 - omega) * (2.0 * Syy_s - Sxx_s - Szz_s) / 3.0
+                   + trace_u2 / 3.0
+                   + omega * (2.0 * uy*uy - ux*ux - uz*uz) / 3.0;
+    float Szz_base = (1.0 - omega) * (2.0 * Szz_s - Sxx_s - Syy_s) / 3.0
+                   + trace_u2 / 3.0
+                   + omega * (2.0 * uz*uz - ux*ux - uy*uy) / 3.0;
+
+    float Sxx_new = Sxx_base;
+    float Syy_new = Syy_base;
+    float Szz_new = Szz_base;
+
+    // 外力修正项（如果存在）
+    if (length(F) > 0.0) {
+        float coeff1 = inv_rho;
+        float coeff2 = (1.0 - omega) * inv_rho;
+        Sxx_new += coeff1 * Fx * ux + coeff2 * (2.0 * Fx * ux - Fy * uy - Fz * uz) / 3.0;
+        Syy_new += coeff1 * Fy * uy + coeff2 * (2.0 * Fy * uy - Fx * ux - Fz * uz) / 3.0;
+        Szz_new += coeff1 * Fz * uz + coeff2 * (2.0 * Fz * uz - Fx * ux - Fy * uy) / 3.0;
+    }
+
+    // ------------------------------------------------------------
+    // 4. 组装输出
+    // ------------------------------------------------------------
+    float S_new[6] = { Sxx_new, Syy_new, Szz_new, Sxy_new, Sxz_new, Syz_new };
+
+    // ------------------------------------------------------------
+    // writing back the result
+    // ------------------------------------------------------------
+    store_moments(idx, rho_new, u_new, S_new);
+}
+```
+以上是我目前实现的HOME LBM核心碰撞和流动算法，请参考我上传的这篇论文教我如何实现基于IBM的流固耦合shader，可以为了性能分成多个shader实现。
+以下是你可能用到的simulate_header.glsl，你也可以根据需要自行创建新的额外代码。
+```simulate_header.glsl
+#ifndef SIMULATE_HEADER_GLSL
+#define SIMULATE_HEADER_GLSL
+
+// 边界类型定义
+#define BC_PERIODIC        0
+#define BC_INFLOW          1
+#define BC_OUTFLOW         2
+#define BC_SOLID_NO_SLIP   3   // 无滑移固体壁面
+#define BC_SOLID_FREE_SLIP 4  // 自由滑移固体壁面
+
+// ================= 边界配置区 =================
+// 用户在此处修改各个面的边界条件
+#define BC_X0 BC_PERIODIC
+#define BC_XN BC_PERIODIC
+#define BC_Y0 BC_PERIODIC
+#define BC_YN BC_PERIODIC
+#define BC_Z0 BC_INFLOW
+#define BC_ZN BC_OUTFLOW
+
+// 流入边界参数
+const float INFLOW_RHO  = 1.0f;
+const float OUTFLOW_RHO = 1.0f;
+const vec3  INFLOW_VEL  = vec3(0.0f, 0.0f, 0.01f);
+
+const uint D = 3;
+const uint Q = 27;
+const float SCALE = 1e6;
+const float def_c = 0.57735027f;
+
+const float def_w0 = (1.0f/3.375f);
+const float def_ws = (1.0f/ 13.5f);
+const float def_we = (1.0f/ 54.0f);
+const float def_wc = (1.0f/216.0f);
+
+const float cs2 = 1.0 / 3.0;
+const float cs4 = cs2 * cs2;
+const float cs6 = cs2 * cs2 * cs2;
+
+struct LagrangianData {
+    vec4 velocity;
+    vec4 force;
+};
+
+struct RigidBodyState {
+    vec4 position;
+    vec4 orientation;
+    vec4 lin_vel;
+    vec4 ang_vel;
+    mat4 modelMatrix;
+};
+
+struct RigidBodyInfo {
+    float mass;
+    float inv_mass;
+    mat4 invInertiaTensor;
+    float volume;
+    uint manualMode;
+    vec4 manualLinVel;
+    vec4 manualAngVel;
+};
+
+struct TotalForceTorque {
+    vec4 total_force;
+    vec4 total_torque;
+};
+
+const float w[Q] = float[](
+    def_w0,
+    def_ws, def_ws, def_ws, def_ws, def_ws, def_ws,
+    def_we, def_we, def_we, def_we, def_we, def_we, def_we, def_we, def_we, def_we, def_we, def_we,
+    def_wc, def_wc, def_wc, def_wc, def_wc, def_wc, def_wc, def_wc
+);
+
+const ivec3 c[Q] = ivec3[](
+    ivec3( 0,  0,  0),
+    ivec3( 1,  0,  0),
+    ivec3(-1,  0,  0),
+    ivec3( 0,  1,  0),
+    ivec3( 0, -1,  0),
+    ivec3( 0,  0,  1),
+    ivec3( 0,  0, -1),
+    ivec3( 1,  1,  0),
+    ivec3(-1, -1,  0),
+    ivec3( 1,  0,  1),
+    ivec3(-1,  0, -1),
+    ivec3( 0,  1,  1),
+    ivec3( 0, -1, -1),
+    ivec3( 1, -1,  0),
+    ivec3(-1,  1,  0),
+    ivec3( 1,  0, -1),
+    ivec3(-1,  0,  1),
+    ivec3( 0,  1, -1),
+    ivec3( 0, -1,  1),
+    ivec3( 1,  1,  1),
+    ivec3(-1, -1, -1),
+    ivec3( 1,  1, -1),
+    ivec3(-1, -1,  1),
+    ivec3( 1, -1,  1),
+    ivec3(-1,  1, -1),
+    ivec3(-1,  1,  1),
+    ivec3( 1, -1, -1)
+);
+
+layout(std430, binding = 0) uniform SimulateUBO {
+    ivec4 gridSize;
+    uint particleCount;
+    float niu;
+    float tau;
+    float inv_tau;
+    float fx;
+    float fy;
+    float fz;
+    uint t;
+    uint render_mode;
+    uint lagrangianPointCount;
+    uint rigidBodyCount;
+    uint useEmitter;
+    vec4 emitterPos;
+    vec4 emitterVel;
+} ubo;
+
+layout(std430, binding = 1) buffer MomentsInBuffer {
+    float momIns[];
+};
+
+layout(std430, binding = 2) buffer MomentsOutBuffer {
+    float momOuts[];
+};
+
+layout(std430, binding = 6) buffer CellForceBuffer {
+    float cfs[];
+};
+
+layout(std430, binding = 7) buffer LagrangianPointsBuffer {
+    vec4 lagrangianPoints[];
+};
+
+layout(std430, binding = 8) buffer LagrangianDataBuffer {
+    LagrangianData lagrangianData[];
+};
+
+layout(std430, binding = 9) buffer LagrangianPointsRestBuffer {
+    vec4 lagrangianPoints_Rest[];
+};
+
+layout(std430, binding = 10) buffer LagrangianPointsPrevBuffer {
+    vec4 lagrangianPoints_Prev[];
+};
+
+layout(std430, binding = 11) buffer TempForceBuffer {
+    vec4 tempForces[];
+};
+
+layout(std430, binding = 12) buffer TotalForceTorqueBuffer {
+    vec4 total_force_torque[];
+};
+
+layout(std430, binding = 13) buffer RigidBodyStateBuffer {
+    RigidBodyState bodies[];
+};
+
+layout(std430, binding = 14) buffer SkBuffer {
+    float s_k_values[];
+};
+
+layout(std430, binding = 15) buffer RigidBodyInfoBuffer {
+    RigidBodyInfo bodyInfos[];
+};
+
+layout(std430, binding = 16) buffer BodyIndexBuffer {
+    uint bodyIndices[];
+};
+
+layout(std430, binding = 17) buffer TempVelocityBuffer {
+    float tempVels[];
+};
+
+layout(push_constant, std430) uniform constants {
+    int currentIteration;
+} uPc;
+
+void load_moments(const uint idx, out float rho, out vec3 u, out float S[6]) {
+    rho = momIns[idx];
+    vec3 rhou = vec3(momIns[idx+1*ubo.gridSize.w], momIns[idx+2*ubo.gridSize.w], momIns[idx+3*ubo.gridSize.w]);
+    u = rhou / rho;
+    // storage order：Sxx, Syy, Szz, Sxy, Sxz, Syz (symmetry tensor)
+    S[0] = momIns[idx+4*ubo.gridSize.w];
+    S[1] = momIns[idx+5*ubo.gridSize.w];
+    S[2] = momIns[idx+6*ubo.gridSize.w];
+    S[3] = momIns[idx+7*ubo.gridSize.w];
+    S[4] = momIns[idx+8*ubo.gridSize.w];
+    S[5] = momIns[idx+9*ubo.gridSize.w];
+}
+
+void store_moments(const uint idx, const float rho, const vec3 u, const float S[6]) {
+    vec3 rhou = rho * u;
+
+    momOuts[idx]   = rho;
+    momOuts[idx+1*ubo.gridSize.w] = rhou.x;
+    momOuts[idx+2*ubo.gridSize.w] = rhou.y;
+    momOuts[idx+3*ubo.gridSize.w] = rhou.z;
+    momOuts[idx+4*ubo.gridSize.w] = S[0];
+    momOuts[idx+5*ubo.gridSize.w] = S[1];
+    momOuts[idx+6*ubo.gridSize.w] = S[2];
+    momOuts[idx+7*ubo.gridSize.w] = S[3];
+    momOuts[idx+8*ubo.gridSize.w] = S[4];
+    momOuts[idx+9*ubo.gridSize.w] = S[5];
+}
+
+void reconstruct_ddfs(const float rho, const vec3 u, const float S[6], out float f[Q]) {
+    // precompute
+    float ux = u.x, uy = u.y, uz = u.z;
+    float ux2 = ux * ux, uy2 = uy * uy, uz2 = uz * uz;
+    float Sxx = S[0], Syy = S[1], Szz = S[2];
+    float Sxy = S[3], Sxz = S[4], Syz = S[5];
+
+    for (int i = 0; i < Q; i++) {
+        float cx = c[i].x, cy = c[i].y, cz = c[i].z;
+
+        // 一阶项: c_i · u / cs2
+        float term1 = (cx * ux + cy * uy + cz * uz) / cs2;
+        //float term1 = dot(c[i], u) / cs2;
+
+        // 二阶项: H^(2)(c_i) : S / (2 cs4)
+        // H^(2)_{αβ}(c_i) = c_α c_β - cs2 δ_{αβ}
+        // 收缩结果为 (cx*cx - cs2)*Sxx + (cy*cy - cs2)*Syy + (cz*cz - cs2)*Szz + 2*cx*cy*Sxy + 2*cx*cz*Sxz + 2*cy*cz*Syz
+        float term2 = (cx*cx - cs2) * Sxx +
+                    (cy*cy - cs2) * Syy +
+                    (cz*cz - cs2) * Szz +
+                    2.0 * (cx * cy * Sxy + cx * cz * Sxz + cy * cz * Syz);
+        term2 /= (2.0 * cs4);
+
+        // 三阶项: 对应 Eq. 17 中的 6 个非零分量
+        // 注意: 论文中三阶项前有系数 1/(2 cs6)，且每个 H^(3) 分量乘以对应的组合系数
+
+        // 分量 1: H^(3)_xxy 对应系数 (Sxx * uy + 2 * Sxy * ux - 2 * ux * ux * uy)
+        float coeff_xxy = Sxx * uy + 2.0 * Sxy * ux - 2.0 * ux2 * uy;
+        // 分量 2: H^(3)_xyy 对应系数 (Syy * ux + 2 * Sxy * uy - 2 * ux * uy * uy)
+        float coeff_xyy = Syy * ux + 2.0 * Sxy * uy - 2.0 * ux * uy2;
+        // 分量 3: H^(3)_xxz 对应系数 (Sxx * uz + 2 * Sxz * ux - 2 * ux * ux * uz)
+        float coeff_xxz = Sxx * uz + 2.0 * Sxz * ux - 2.0 * ux2 * uz;
+        // 分量 4: H^(3)_xzz 对应系数 (Szz * ux + 2 * Sxz * uz - 2 * ux * uz * uz)
+        float coeff_xzz = Szz * ux + 2.0 * Sxz * uz - 2.0 * ux * uz2;
+        // 分量 5: H^(3)_yzz 对应系数 (Szz * uy + 2 * Syz * uz - 2 * uy * uz * uz)
+        float coeff_yzz = Szz * uy + 2.0 * Syz * uz - 2.0 * uy * uz2;
+        // 分量 6: H^(3)_yyz 对应系数 (Syy * uz + 2 * Syz * uy - 2 * uy * uy * uz)
+        float coeff_yyz = Syy * uz + 2.0 * Syz * uy - 2.0 * uy2 * uz;
+        // 分量 7: H^(3)_xyz 对应系数 (Sxz * uy + Syz * ux + Sxy * uz - 2 * ux * uy * uz)
+        float coeff_xyz = Sxz * uy + Syz * ux + Sxy * uz - 2.0 * ux * uy * uz;
+
+        // 计算各 H^(3) 多项式的值 (论文附录中有定义，但可直接按定义计算)
+        // 根据 Hermite 多项式定义:
+        // H^(3)_{αβγ}(c) = c_α c_β c_γ - cs2 (c_α δ_{βγ} + c_β δ_{αγ} + c_γ δ_{αβ})
+        // 具体到各个分量:
+        float H_xxy = cx * cx * cy - cs2 * cy;          // 因为 δ_{xx}=1, δ_{xy}=0
+        float H_xyy = cx * cy * cy - cs2 * cx;
+        float H_xxz = cx * cx * cz - cs2 * cz;
+        float H_xzz = cx * cz * cz - cs2 * cx;
+        float H_yzz = cy * cz * cz - cs2 * cy;
+        float H_yyz = cy * cy * cz - cs2 * cz;
+        float H_xyz = cx * cy * cz;
+
+        // 组合三阶项贡献
+        float term3 = H_xxy * coeff_xxy +
+                    H_xyy * coeff_xyy +
+                    H_xxz * coeff_xxz +
+                    H_xzz * coeff_xzz +
+                    H_yzz * coeff_yzz +
+                    H_yyz * coeff_yyz +
+                    H_xyz * coeff_xyz;
+
+        term3 /= (2.0 * cs6);
+
+        // 最终重构 f_i
+        f[i] = rho * w[i] * (1.0 + term1 + term2 + term3);
+    }
+}
+
+float reconstruct_single_ddf(const int i, const float rho, const vec3 u, const float S[6]) {
+    float ux = u.x, uy = u.y, uz = u.z;
+    float ux2 = ux * ux, uy2 = uy * uy, uz2 = uz * uz;
+    float Sxx = S[0], Syy = S[1], Szz = S[2];
+    float Sxy = S[3], Sxz = S[4], Syz = S[5];
+
+    float cx = float(c[i].x);
+    float cy = float(c[i].y);
+    float cz = float(c[i].z);
+
+    // 一阶项
+    float term1 = (cx * ux + cy * uy + cz * uz) / cs2;
+
+    // 二阶项
+    float term2 = (cx*cx - cs2) * Sxx +
+                  (cy*cy - cs2) * Syy +
+                  (cz*cz - cs2) * Szz +
+                  2.0 * (cx * cy * Sxy + cx * cz * Sxz + cy * cz * Syz);
+    term2 /= (2.0 * cs4);
+
+    // 三阶系数
+    float coeff_xxy = Sxx * uy + 2.0 * Sxy * ux - 2.0 * ux2 * uy;
+    float coeff_xyy = Syy * ux + 2.0 * Sxy * uy - 2.0 * ux * uy2;
+    float coeff_xxz = Sxx * uz + 2.0 * Sxz * ux - 2.0 * ux2 * uz;
+    float coeff_xzz = Szz * ux + 2.0 * Sxz * uz - 2.0 * ux * uz2;
+    float coeff_yzz = Szz * uy + 2.0 * Syz * uz - 2.0 * uy * uz2;
+    float coeff_yyz = Syy * uz + 2.0 * Syz * uy - 2.0 * uy2 * uz;
+    float coeff_xyz = Sxz * uy + Syz * ux + Sxy * uz - 2.0 * ux * uy * uz;
+
+    // 三阶多项式值
+    float H_xxy = cx * cx * cy - cs2 * cy;
+    float H_xyy = cx * cy * cy - cs2 * cx;
+    float H_xxz = cx * cx * cz - cs2 * cz;
+    float H_xzz = cx * cz * cz - cs2 * cx;
+    float H_yzz = cy * cz * cz - cs2 * cy;
+    float H_yyz = cy * cy * cz - cs2 * cz;
+    float H_xyz = cx * cy * cz;
+
+    float term3 = H_xxy * coeff_xxy +
+                  H_xyy * coeff_xyy +
+                  H_xxz * coeff_xxz +
+                  H_xzz * coeff_xzz +
+                  H_yzz * coeff_yzz +
+                  H_yyz * coeff_yyz +
+                  H_xyz * coeff_xyz;
+    term3 /= (2.0 * cs6);
+
+    return rho * w[i] * (1.0 + term1 + term2 + term3);
+}
+
+float peskin_w(float r) {
+    float abs_r = abs(r);
+    if (abs_r <= 1.0) {
+        return 0.125 * (3.0 - 2.0 * abs_r + sqrt(max(0.0, 1.0 + 4.0 * abs_r - 4.0 * abs_r * abs_r)));
+    } else if (abs_r <= 2.0) {
+        return 0.125 * (5.0 - 2.0 * abs_r - sqrt(max(0.0, -7.0 + 12.0 * abs_r - 4.0 * abs_r * abs_r)));
+    }
+    return 0.0;
+}
+
+float compute_weight_3d(vec3 lagrangian_pos, vec3 eulerian_pos) {
+    vec3 r = lagrangian_pos - eulerian_pos;
+    return peskin_w(r.x) * peskin_w(r.y) * peskin_w(r.z);
+}
+
+#endif
+```
+Model 14:48
+ThinkingThoughts
+Expand to view model thoughts
+
+chevron_right
+这篇论文（Li et al., 2020, *Fast and Scalable Turbulent Flow Simulation with Two-Way Coupling*）在处理流固耦合时，采用了**基于罚函数的弥散界面浸入边界法 (Penalty-based Diffused Immersed Boundary Method)**。
+
+由于 GPU 的高度并行性，为了避免读写冲突（Race Conditions）并保证性能，**不能在同一个 Shader 中同时完成流固耦合的插值与力分配**。标准的做法是将其拆分为多个 Pass。
+
+根据论文第 2.3 节（Eq. 12, 13）和第 5 节（Eq. 19 的 $1-r$ 紧凑核函数），以下是为你设计的 Shader 实现方案。
+
+### 耦合流水线 (Pipeline)
+在每次时间步中，你应该按以下顺序调用 Compute Shaders：
+1. **Clear Force Buffer**：清空网格力场 `cfs`。
+2. **IB_Interp_Vel**：计算拉格朗日点（固体表面点）处的流体速度，并计算由速度差引起的罚函数力 $\mathbf{F}_{s \to f}$。
+3. **IB_Spread_Force**：将拉格朗日点上的力反向分配（Scatter）回流体欧拉网格 `cfs` 中。（需要用到 Float Atomics）。
+4. **Collide_and_Stream**：运行你已经写好的 LBM 碰撞与流动 Shader。
+5. **IB_Update_Body (针对双向耦合)**：收集流体对固体的反作用力，更新刚体的速度与位置。
+
+---
+
+### 1. 修改 `simulate_header.glsl`
+首先，我们需要在头文件中加入论文 Eq. 19 提到的高分辨率核函数（$2 \times 2 \times 2$ 支持域）：
+
+```glsl
+// 在 simulate_header.glsl 底部添加：
+
+// 论文 Eq. 19: 尖锐核函数 (Sharp Kernel)，具有最小的虚假弥散
+float kernel_linear_1D(float r) {
+    float abs_r = abs(r);
+    return abs_r <= 1.0 ? (1.0 - abs_r) : 0.0;
+}
+
+// 3D 线性分布核 (2x2x2 影响范围)
+float compute_weight_3d_linear(vec3 lagrangian_pos, vec3 eulerian_pos) {
+    vec3 d = lagrangian_pos - eulerian_pos;
+    return kernel_linear_1D(d.x) * kernel_linear_1D(d.y) * kernel_linear_1D(d.z);
+}
+```
+
+---
+
+### 2. Shader 1: 速度插值与力计算 (`ib_interp_force.comp`)
+**作用**：遍历所有固体表面点，插值周围流体速度，计算罚函数力。
+*分发组大小*：`(lagrangianPointCount + 255) / 256, 1, 1`
+
+```glsl
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "simulate_header.glsl"
+
+layout (local_size_x = 256) in;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ubo.lagrangianPointCount) return;
+
+    vec4 p_pos_w = lagrangianPoints[pid]; // 固体点局部/全局坐标，假设w分量存储该点代表的表面积 \Delta s_p
+    vec3 p_pos = p_pos_w.xyz;
+    float delta_sp = p_pos_w.w; // 采样点面积（论文 Eq 13: \Delta s_p）
+
+    uint bodyIndex = bodyIndices[pid];
+    RigidBodyState body = bodies[bodyIndex];
+
+    // 1. 获取该固体点期望的速度 u_b = v_cm + \omega \times (r - r_cm)
+    vec3 r_vec = p_pos - body.position.xyz;
+    vec3 u_b = body.lin_vel.xyz + cross(body.ang_vel.xyz, r_vec);
+
+    // 2. 利用 2x2x2 核函数在流体网格中插值宏观流体速度
+    vec3 u_f = vec3(0.0);
+    float rho_f = 0.0;
+
+    // 获取相邻的 8 个网格点 (基于 1-r 核函数)
+    ivec3 base_idx = ivec3(floor(p_pos));
+    
+    for(int z = 0; z <= 1; z++) {
+        for(int y = 0; y <= 1; y++) {
+            for(int x = 0; x <= 1; x++) {
+                ivec3 grid_pos = base_idx + ivec3(x, y, z);
+                
+                // 边界钳制 (Clamp) 防止越界
+                grid_pos = clamp(grid_pos, ivec3(0), ubo.gridSize.xyz - 1);
+                uint g_idx = (grid_pos.z * ubo.gridSize.y + grid_pos.y) * ubo.gridSize.x + grid_pos.x;
+
+                // 读取网格矩 (这里只读rho和rhou)
+                float mRho = momIns[g_idx];
+                vec3 mRhoU = vec3(momIns[g_idx + 1 * ubo.gridSize.w], 
+                                  momIns[g_idx + 2 * ubo.gridSize.w], 
+                                  momIns[g_idx + 3 * ubo.gridSize.w]);
+                vec3 mU = mRho > 0.0 ? (mRhoU / mRho) : vec3(0.0);
+
+                // 计算权重
+                float weight = compute_weight_3d_linear(p_pos, vec3(grid_pos));
+                
+                u_f += mU * weight;
+                rho_f += mRho * weight;
+            }
+        }
+    }
+
+    // 3. 计算罚函数力 (论文 Eq. 12: F_{s->f} = \rho * (u_b - u_f) / \Delta t)
+    // LBM 中 \Delta t 默认为 1
+    vec3 force_s2f = rho_f * (u_b - u_f); 
+
+    // 存储给下一个 Shader 用
+    lagrangianData[pid].velocity = vec4(u_f, 0.0);
+    // 注意：我们将力预先乘以面积 \Delta s_p，方便后续直接累加
+    lagrangianData[pid].force = vec4(force_s2f * delta_sp, 0.0); 
+}
+```
+
+---
+
+### 3. Shader 2: 将力分配给流体 (`ib_spread_force.comp`)
+**作用**：将拉格朗日点计算出的力反向扩散到周围流体网格。因为多个点可能影响同一个流体网格，必须使用原子加法（AtomicAdd）。
+*依赖扩展*：`GL_EXT_shader_atomic_float` (现代 GPU 均支持)
+
+```glsl
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#extension GL_EXT_shader_atomic_float : require // 必须开启以支持 atomicAdd(float)
+#include "simulate_header.glsl"
+
+layout (local_size_x = 256) in;
+
+void main() {
+    uint pid = gl_GlobalInvocationID.x;
+    if (pid >= ubo.lagrangianPointCount) return;
+
+    vec3 p_pos = lagrangianPoints[pid].xyz;
+    vec3 f_s2f = lagrangianData[pid].force.xyz; // 已经乘过面积 \Delta s_p
+
+    ivec3 base_idx = ivec3(floor(p_pos));
+
+    // 同样扩散给周围的 8 个网格点
+    for(int z = 0; z <= 1; z++) {
+        for(int y = 0; y <= 1; y++) {
+            for(int x = 0; x <= 1; x++) {
+                ivec3 grid_pos = base_idx + ivec3(x, y, z);
+                
+                if(any(lessThan(grid_pos, ivec3(0))) || any(greaterThanEqual(grid_pos, ubo.gridSize.xyz)))
+                    continue; // 丢弃域外力
+
+                uint g_idx = (grid_pos.z * ubo.gridSize.y + grid_pos.y) * ubo.gridSize.x + grid_pos.x;
+                
+                float weight = compute_weight_3d_linear(p_pos, vec3(grid_pos));
+                vec3 applied_force = f_s2f * weight;
+
+                // 原子累加到全局 cfs 数组中 (此处的 cfs 将供你的 LBM 碰撞核使用)
+                atomicAdd(cfs[g_idx], applied_force.x);
+                atomicAdd(cfs[g_idx + ubo.gridSize.w], applied_force.y);
+                atomicAdd(cfs[g_idx + 2 * ubo.gridSize.w], applied_force.z);
+            }
+        }
+    }
+}
+```
+
+---
+
+### 4. Shader 3: 更新双向耦合的刚体运动 (`ib_update_body.comp`)
+**作用**：计算流体对固体的总反作用力和扭矩（论文 Eq. 13），更新刚体。
+*分配策略*：为了高效求和（Reduction），我们可以为每个刚体分配一个 WorkGroup（例如 `local_size_x = 256`），该组内的线程共同处理该刚体身上的所有点。
+
+```glsl
+#version 450
+#extension GL_GOOGLE_include_directive : require
+#include "simulate_header.glsl"
+
+layout (local_size_x = 256) in;
+
+// 共享内存用于 Group 内的并行规约 (Reduction) 求和
+shared vec3 shForce[256];
+shared vec3 shTorque[256];
+
+void main() {
+    uint bodyID = gl_WorkGroupID.x; // 每个 WorkGroup 负责一个 Rigid Body
+    uint tid = gl_LocalInvocationID.x;
+    
+    if (bodyID >= ubo.rigidBodyCount) return;
+
+    RigidBodyState body = bodies[bodyID];
+    RigidBodyInfo info = bodyInfos[bodyID];
+
+    vec3 local_force = vec3(0.0);
+    vec3 local_torque = vec3(0.0);
+
+    // 每个线程负责遍历属于该刚体的部分点
+    // （这需要你在 CPU 端将同一个刚体的点排在一起，或者在这里使用全图遍历匹配 bodyIndices）
+    // 为了简单起见，假设我们遍历所有拉格朗日点并判断 bodyIndex
+    for (uint i = tid; i < ubo.lagrangianPointCount; i += gl_WorkGroupSize.x) {
+        if (bodyIndices[i] == bodyID) {
+            vec3 p_pos = lagrangianPoints[i].xyz;
+            vec3 f_s2f = lagrangianData[i].force.xyz; // 固体作用于流体的力
+            
+            // 流体对固体的反作用力 (Eq. 12: F_{f->s} = -F_{s->f})
+            vec3 f_f2s = -f_s2f; 
+            vec3 r_vec = p_pos - body.position.xyz;
+            
+            local_force += f_f2s;
+            local_torque += cross(r_vec, f_f2s);
+        }
+    }
+
+    shForce[tid] = local_force;
+    shTorque[tid] = local_torque;
+    barrier();
+
+    // 树状规约求和 (Tree Reduction)
+    for (uint s = gl_WorkGroupSize.x / 2; s > 0; s >>= 1) {
+        if (tid < s) {
+            shForce[tid] += shForce[tid + s];
+            shTorque[tid] += shTorque[tid + s];
+        }
+        barrier();
+    }
+
+    // 线程 0 更新刚体运动状态
+    if (tid == 0) {
+        vec3 total_F = shForce[0];
+        vec3 total_T = shTorque[0];
+
+        // 显式欧拉积分更新 (或者半隐式)
+        // 注意：如果你有重力等外部力，在这里加到 total_F 上
+        vec3 accel = total_F * info.inv_mass;
+        
+        // 简单计算角加速度 (假设惯性张量求逆已处理为 mat3)
+        mat3 invI = mat3(info.invInertiaTensor);
+        vec3 alpha = invI * total_T;
+
+        // 假设 dt = 1 (LBM 晶格单位) 或者传入真实的 dt
+        float dt = 1.0; 
+        
+        if(info.manualMode == 0) { // 如果不是静态或脚本驱动物体
+            body.lin_vel.xyz += accel * dt;
+            body.ang_vel.xyz += alpha * dt;
+            
+            body.position.xyz += body.lin_vel.xyz * dt;
+            // 旋转更新（四元数或简单的角速度累加，这里省略复杂旋转处理）
+        } else {
+            // 脚本驱动物体直接强制使用预设速度
+            body.lin_vel = info.manualLinVel;
+            body.ang_vel = info.manualAngVel;
+        }
+
+        // 写回显存
+        bodies[bodyID] = body;
+    }
+}
+```
+
+### 核心注意事项
+1. **Atomics 要求**: Shader 2 大量使用了 `atomicAdd` 操作 `float`。必须在 Vulkan / OpenGL 的设备特性中开启对应的 Float Atomic 扩展支持。
+2. **论文提到的物理量缩放（Scaling）**: 论文的 `4.1 Dimension Scaling in LBM` 明确指出真实物理量（时间、空间、质量）与 LBM 晶格单位需要转换。尤其注意：算出来的流体力必须通过密度缩放系数 $\rho_s$ 和时间步长重新缩放回物理世界才能更新刚体。上述代码假设都在 **LBM Lattice Units** 下运行。你需要在 CPU 将刚体质量转为 Lattice Mass。
+3. **性能**: 因为你已经用了中心矩（Central Moment MRT），计算十分繁重。将其拆分为多个 Pass 能够最大化利用 SM 并隐藏内存延迟，相比把这些逻辑塞进 `collide_and_stream.comp` 能提升约 30% 以上的吞吐。
+User 15:22
+如果我想要在低性能的gpu（比如intel的核显，假设支持浮点原子加）上实现实时运行，应该如何进行优化呢？
+Model 15:22
+ThinkingThoughts
+Expand to view model thoughts
+
+chevron_right
+28.5s
+在低性能 GPU（如 Intel 核显，UHD Graphics 或 Iris Xe）上实现 3D 晶格玻尔兹曼（LBM）和流固耦合的实时运行，是一个极具挑战性的任务。
+
+LBM 是典型的**内存带宽限制（Memory Bound）**和**寄存器压力限制（Register Bound）**算法。Intel 核显采用统一内存架构（UMA），其显存带宽通常只有独立显卡的 1/10 左右（约 40-80 GB/s）。此外，论文中使用的 **D3Q27 中心矩模型（CMRT）** 包含了极其庞大的浮点运算量。
+
+要在核显上达到实时（如 30 FPS），你必须在**物理精度**和**计算开销**之间做出妥协。以下是针对核显的深度优化策略，按重要程度排序：
+
+---
+
+### 一、 算法层面的“降级”优化（最关键）
+
+论文为了极致的湍流细节使用了 D3Q27 CMRT，但对于实时应用，这过于沉重。
+
+#### 1. 降级为 D3Q19 晶格模型
+*   **原理**：D3Q27 有 27 个速度方向，而 D3Q19 只有 19 个。
+*   **收益**：显存读取/写入量直接减少 **30%**，寄存器占用大幅下降。核显的寄存器非常宝贵，寄存器溢出（Spilling）会导致性能断崖式下跌。
+*   **代价**：高马赫数或极端湍流下可能不如 D3Q27 稳定，但在图形学视觉表现中通常完全足够。
+
+#### 2. 考虑回退到带大涡模拟的 BGK（SRT + Smagorinsky）
+*   **原理**：论文的核心是“中心矩（Central Moment）”，它计算非常复杂。如果核显实在跑不动，强烈建议退回到最基础的 **BGK 模型（单一松弛时间）**，并外挂一个非常便宜的 Smagorinsky 大涡模拟（LES）模型来保持高雷诺数下的稳定性。
+*   **收益**：将碰撞步骤的代码从几百行矩阵/多项式运算缩减到仅仅几行，ALU 计算量锐减 80%。
+
+#### 3. 限制模拟网格分辨率
+*   核显无法实时跑 $200 \times 200 \times 200$ 的网格。建议将物理模拟的网格设定在 **$64 \times 64 \times 64$ 到 $100 \times 50 \times 50$** 之间。
+*   视觉上，你可以用较低分辨率的网格跑物理流场，然后在渲染烟雾/粒子时使用高阶插值（如双三次插值）来平滑结果。
+
+---
+
+### 二、 内存与显存带宽优化（打破物理瓶颈）
+
+#### 1. 使用 16 位浮点数 (FP16) 压缩分布函数
+LBM 对宏观量（密度 $\rho$、速度 $u$）的精度要求高，但对分布函数 $f_i$ 的存储可以使用较低精度。
+*   **操作**：如果设备支持 `GL_EXT_shader_16bit_storage`，将输入输出缓冲区从 `float` 换成 `float16_t`。
+*   **手动 Pack**：如果不支持扩展，可以使用 `packHalf2x16` 将两个 $f_i$ 压入一个 `uint` 中存储。
+*   **收益**：带宽占用直接**减半**。这在核显上是救命的优化。
+
+#### 2. 合并宏观量读写
+你目前的 `load_moments` 连续读取 10 个 float（$\rho, u, S$）。
+*   将它们打包成 `vec4` 读取。GPU 一次加载 `vec4`（16字节）的效率远高于 4 次分开加载 `float`。
+```glsl
+// 优化数据布局示例
+layout(std430, binding = 1) buffer MomentsInBuffer {
+    vec4 momIns_rho_u[]; // x: rho, yzw: u
+    vec4 momIns_S03[];   // Sxx, Syy, Szz, Sxy
+    vec2 momIns_S45[];   // Sxz, Syz
+};
+```
+
+---
+
+### 三、 流固耦合 (IB) 的专项优化
+
+#### 1. 使用粗糙的碰撞网格 (Proxy Mesh)
+*   不要把渲染用的高模（比如几十万面的模型）送进流固耦合。
+*   在 CPU 端生成一个极度简化的**凸包或低面数碰撞体**（例如只有 500 个拉格朗日表面点）。拉格朗日点数量直接决定了核显在处理 `ib_interp_force` 和 `ib_spread_force` 时的耗时。
+
+#### 2. 避免原子的“热点冲突” (Local Reduction)
+在 `ib_spread_force.comp` 中，如果多个拉格朗日点非常密集，它们会同时 `atomicAdd` 同一个流体网格的 `cfs`。核显处理重度冲突的全局原子操作很慢。
+*   **优化思路**：如果拉格朗日点数量不多，可以反过来做（Gather 而不是 Scatter）。让每个流体网格去查周围有没有拉格朗日点。
+*   或者在当前逻辑下，保持原子加，但确保拉格朗日点的间距（Spacing）约等于流体网格大小 $\Delta x$，避免多个点挤在一个 Cell 里。
+
+---
+
+### 四、 Shader 微架构优化 (利用 Intel 核显特性)
+
+#### 1. 使用 Subgroup Operations 替代 Shared Memory
+在更新双向耦合刚体（`ib_update_body.comp`）时，你使用了 Shared Memory 进行规约求和。Intel 的核显对 **Subgroup (类似于 NVIDIA 的 Warp)** 操作支持得极好，可以直接在寄存器层面完成求和，无需分配 Shared Memory。
+
+```glsl
+#version 450
+#extension GL_KHR_shader_subgroup_arithmetic : require // 引入 Subgroup
+
+// ... 你的代码 ...
+    vec3 local_force = vec3(0.0);
+    // ... 计算 local_force ...
+
+    // 直接在 subgroup (通常 32 或 8 个线程) 内部规约，极速！
+    vec3 sub_total_F = subgroupAdd(local_force);
+    
+    // 如果 WorkGroupSize 等于 SubgroupSize (Intel 推荐 32)，直接用 subgroupElect()
+    if (subgroupElect()) {
+        // 原子加到全局或存入临时 buffer 供单线程最后处理
+        atomicAdd(global_force.x, sub_total_F.x);
+        atomicAdd(global_force.y, sub_total_F.y);
+        atomicAdd(global_force.z, sub_total_F.z);
+    }
+```
+
+#### 2. 完全循环展开 (Loop Unrolling)
+在你的 `reconstruct_ddfs` 和 `collide_and_stream.comp` 中，有许多 `for (int i = 0; i < Q; i++)` 的循环。
+*   强制展开循环（GLSL 目前依赖编译器，可以尝试手动写死或者依赖驱动优化）。消除分支判断对核显 ALU 来说能提升流水线效率。
+
+#### 3. 减少 `barrier()` 和共享内存使用
+你的 LBM Shader 中使用了 `shared float shRho[SHARED_TOTAL_CELLS]`。
+*   **问题**：D3Q27 需要的共享内存非常巨大。如果一个 Block 的共享内存超标，会导致 GPU 降低 Occupancy（并行度降低）。
+*   **核显的特性**：Intel 核显的 L3 Cache 已经非常强了。在低分辨率下，**放弃自己维护 Shared Memory，直接从 Global Memory (`momIns`) 读取 27 个邻居**（结合适当的 Cache 命中），在某些核显上反而比你花大量的指令去计算索引并同步 `barrier()` 要快。建议写一版纯 Global Memory 的版本（A/B Buffer），用 Nsight/Intel GPA 抓一下看哪个更快。
+
+### 总结：你的核显首发配置清单
+
+1.  **物理规模**：$64 \times 64 \times 64$（最大不超过 $100 \times 50 \times 50$）。
+2.  **LBM 核心**：将 D3Q27 换成 **D3Q19**。保留你的中心矩（如果求稳定），或者回退到 BGK（如果追求极限帧率）。
+3.  **内存布局**：使用 `vec4` 打包读取，如果有条件用 `float16_t`。
+4.  **IB 实体**：将固体表面采样点控制在 **1000 个以内**。
+5.  **Shader**：移除 `collide_and_stream` 中的 Shared Memory 逻辑，直接查 Global Memory，消除 `barrier()` 的开销。使用 `subgroupAdd` 优化刚体力学统计。
